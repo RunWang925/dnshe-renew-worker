@@ -2,43 +2,19 @@
 项目名称：dnshe-renew-worker
 访问地址：部署后为你的workers域名
 功能：DNSHE子域名自动续期网页面板
-API文档参考：https://my.dnshe.com/knowledgebase/13/DNSHE-Free-Domain-API-User-Guide-V2.0.html
+API文档参考：https://my.dnshe.com/docs/api
 
 【DNSHE官方规则】
-免费域名注册有效期1年；仅到期前180天以内，API才允许提交免费续期；
-续期成功：到期时间直接增加365天；
-never_expires=1：永久域名，无需续期，永久有效。
+免费域名有效期1年，到期前180天内允许免费续期；
+续期成功：到期时间+365天
+never_expires=1：永久域名，跳过续期
 
-【运行逻辑说明】
-1. 调用DNSHE v2 API，拉取账号全部域名列表
-2. 遍历域名：
-   - never_expires =1 → 永久域名，跳过，日志输出：到期时间:永久有效
-   - never_expires =0 → 普通免费域名，读取expires_at到期时间，计算剩余天数
-3. 续期触发规则：剩余天数 ≤180天，发起续期请求
-   - 剩余>180天：官方未开放续期，跳过
-   - 续期成功：到期时间+365天，下一轮巡检时剩余天数远大于180，不会再次触发
-   - 续期失败：下一次Cron执行会继续重试（兜底）
-4. 页面日志输出：每个域名到期时间、剩余天数、续期结果；结束输出汇总统计
+【环境变量说明】
+API_KEY      必填 DNSHE API Key
+API_SECRET   必填 DNSHE API Secret
+PANEL_PASSWORD  可选，面板访问密码；不设置则免密直接打开面板
 
-【定时Cron策略】
-Cron设置：每90天自动运行一次
-优点：资源消耗低；正常场景仅执行一次续期；续期失败可提供1次重试冗余，作为兜底保障
-缺点：窗口期内最多2次尝试；如果两轮执行全部失败，域名会过期，需要人工关注日志
-
-【当前已知永久域名（仅记录存档，非硬编码黑名单）】
-zoeay.us.ci (ID:229156)，接口返回 never_expires=1，自动跳过
-> 新增其他永久域名无需修改代码，自动识别never_expires字段
-
-【环境变量】
-API_KEY
-API_SECRET
-
-【更新日志】
-2026-10-12
-1. 每条域名日志增加到期时间输出；永久域名标记到期时间:永久有效
-2. 增加统计项：本次总计续费成功X个域名
-3. 日志面板改为白底黑字
-4. 修正：续期成功，到期时间直接+365天
+【Cron定时】0 0 */90 * *  每90天执行一次
 */
 const API_HOST = "https://my.dnshe.com";
 const API_VERSION = "v2";
@@ -48,15 +24,36 @@ const DAY_SECONDS = 24 * 60 * 60;
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // 定时任务路径 /run 不做密码校验（Cron后台调用）
     if (url.pathname === "/run") {
       return await handleRun(env);
     }
-    return new Response(pageHtml(), {
-      headers: { "content-type": "text/html;charset=utf-8" }
+
+    // ========== 网页面板，密码校验逻辑 ==========
+    const panelPwd = env.PANEL_PASSWORD;
+    // 如果没有配置密码，直接返回页面
+    if (!panelPwd || panelPwd.trim() === "") {
+      return new Response(pageHtml(""), {
+        headers: { "content-type": "text/html;charset=utf-8" },
+      });
+    }
+
+    // 从url参数获取密码
+    const passParam = url.searchParams.get("pwd");
+    if (!passParam || passParam !== panelPwd.trim()) {
+      return new Response(passwordPage(), {
+        headers: { "content-type": "text/html;charset=utf-8" },
+      });
+    }
+    // 密码正确，展示面板
+    return new Response(pageHtml(""), {
+      headers: { "content-type": "text/html;charset=utf-8" },
     });
-  }
+  },
 };
 
+// 核心续期逻辑，Cron和网页执行共用
 async function handleRun(env) {
   const stream = new ReadableStream({
     async start(controller) {
@@ -66,7 +63,7 @@ async function handleRun(env) {
       let renewSuccessCount = 0;
       try {
         if (!env.API_KEY || !env.API_SECRET) {
-          send("❌ 错误：请配置环境变量 API_KEY 和 API_SECRET");
+          send("❌ 缺少环境变量 API_KEY / API_SECRET");
           controller.close();
           return;
         }
@@ -75,7 +72,7 @@ async function handleRun(env) {
           headers: {
             "X-API-Key": env.API_KEY,
             "X-API-Secret": env.API_SECRET,
-            "User-Agent": "CloudflareWorker-DNSHE-Renew"
+            "User-Agent": "DNSHE-Renew-Worker"
           }
         });
         const listJson = await listResp.json();
@@ -85,52 +82,51 @@ async function handleRun(env) {
           return;
         }
         const domains = listJson.data;
-        send(`找到 ${domains.length} 个域名，仅剩余 ≤${RENEW_BEFORE_DAYS} 天才执行续期`);
+        send(`✅ 一共获取到 ${domains.length} 个域名`);
+
         for (const item of domains) {
-          const id = item.id;
-          const domain = item.domain;
-          send(`处理: ${domain} (ID:${id})`);
-          if (item.never_expires === 1) {
-            send(`✅ ${domain} 永久域名，到期时间:永久有效，跳过`);
+          const { id, domain, never_expires, expire_at } = item;
+          send(`--- 处理域名：${domain} (ID:${id})`);
+          if (never_expires === 1) {
+            send(`✅ ${domain} 是永久域名，跳过续期`);
             await sleep(300);
             continue;
           }
-          const expireStr = item.expires_at;
-          send(`到期时间:${expireStr}`);
-          const expireTime = new Date(expireStr).getTime();
-          const now = Date.now();
-          const remainMs = expireTime - now;
-          const remainDays = Math.floor(remainMs / (1000 * DAY_SECONDS));
-          send(`剩余天数:${remainDays}`);
+          const expireTs = new Date(expire_at).getTime();
+          const nowTs = Date.now();
+          const remainSec = (expireTs - nowTs) / 1000;
+          const remainDays = Math.floor(remainSec / DAY_SECONDS);
+          send(`ℹ️ ${domain} 剩余有效期：${remainDays} 天`);
+
           if (remainDays > RENEW_BEFORE_DAYS) {
-            send(`剩余天数大于${RENEW_BEFORE_DAYS}天，暂不续期`);
+            send(`⏭️ ${domain} 距离到期超过${RENEW_BEFORE_DAYS}天，暂不续期`);
             await sleep(300);
             continue;
           }
-          // 发起续期
+          send(`🔔 ${domain} 满足续期条件，发起续期请求`);
           const renewResp = await fetch(`${API_HOST}/api/${API_VERSION}/domain/renew`, {
             method: "POST",
             headers: {
               "X-API-Key": env.API_KEY,
               "X-API-Secret": env.API_SECRET,
               "Content-Type": "application/json",
-              "User-Agent": "CloudflareWorker-DNSHE-Renew"
+              "User-Agent": "DNSHE-Renew-Worker"
             },
-            body: JSON.stringify({ id: item.id })
+            body: JSON.stringify({ id })
           });
           const renewResult = await renewResp.json();
           if (renewResult.success) {
-            renewSuccessCount +=1;
-            send(`🎉 ${domain} 续期成功！接口返回信息：${renewResult.message}`);
+            renewSuccessCount += 1;
+            send(`🎉 ${domain} 续期成功，${renewResult.message}`);
           } else {
-            send(`❌ ${domain} 续期失败，原因：${renewResult.message}`);
+            send(`❌ ${domain} 续期失败：${renewResult.message}`);
           }
           await sleep(800);
         }
-        send("全部完成");
-        send(`✅ 本次总计续费成功：${renewSuccessCount} 个域名`);
-      } catch (e) {
-        send(`异常：${e.message}`);
+        send("\n✅ 全部任务执行完毕");
+        send(`本次成功续期域名数量：${renewSuccessCount}`);
+      } catch (err) {
+        send(`💥 执行异常：${err.message}`);
       } finally {
         controller.close();
       }
@@ -140,22 +136,57 @@ async function handleRun(env) {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      "Connection": "keep-alive"
-    }
+      "Connection": "keep-alive",
+    },
   });
 }
 
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// 密码输入页面
+function passwordPage() {
+  return `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>访问验证</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:system-ui}
+body{background:#f0f2f5;display:flex;align-items:center;justify-content:center;height:100vh}
+.box{background:#fff;padding:32px;border-radius:12px;box-shadow:0 2px 12px #00000014;width:360px}
+h2{margin-bottom:20px;color:#222;text-align:center}
+input{width:100%;padding:12px;font-size:16px;border:1px solid #ddd;border-radius:8px;outline:none;margin-bottom:16px}
+button{width:100%;padding:12px;background:#2563eb;color:#fff;border:0;border-radius:8px;font-size:16px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="box">
+  <h2>面板访问密码</h2>
+  <input id="pwd" type="password" placeholder="请输入访问密码">
+  <button onclick="check()">提交</button>
+</div>
+<script>
+function check(){
+  const pwd = document.getElementById('pwd').value.trim();
+  if(!pwd)return;
+  location.href="?pwd="+encodeURIComponent(pwd);
+}
+</script>
+</body>
+</html>`;
+}
+
+// 主面板页面
 function pageHtml() {
   return `
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>DNSHE 域名自动续期</title>
+<title>DNSHE 域名自动续期面板</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;font-family:system-ui}
 body{background:#f0f2f5;padding:20px}
@@ -177,19 +208,18 @@ const logBox = document.getElementById('log');
 btn.onclick = async () => {
   btn.disabled = true;
   logBox.textContent = "";
-  const es = new EventSource("/run");
-  es.onmessage = e => {
+  const source = new EventSource("/run");
+  source.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     logBox.textContent += msg + "\\n";
     logBox.scrollTop = logBox.scrollHeight;
   };
-  es.onerror = () => {
-    es.close();
+  source.onerror = () => {
+    source.close();
     btn.disabled = false;
   }
 }
 </script>
 </body>
-</html>
-`;
+</html>`;
 }
