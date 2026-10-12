@@ -1,20 +1,13 @@
 /*
 项目名称：dnshe-renew-worker
-访问地址：部署后为你的workers域名
-功能：DNSHE子域名自动续期网页面板
-API文档参考：https://my.dnshe.com/docs/api
-
-【DNSHE官方规则】
-免费域名有效期1年，到期前180天内允许免费续期；
-续期成功：到期时间+365天
-never_expires=1：永久域名，跳过续期
-
-【环境变量说明】
+访问地址：workers.dev域名
+功能：DNSHE域名自动续期网页面板
+环境变量说明
 API_KEY      必填 DNSHE API Key
 API_SECRET   必填 DNSHE API Secret
-PANEL_PASSWORD  可选，面板访问密码；不设置则免密直接打开面板
+PANEL_PASSWORD  可选，面板访问密码；不配置默认admin；设置为空字符串""则关闭密码免密访问
 
-【Cron定时】0 0 */90 * *  每90天执行一次
+Cron定时：0 0 */90 * *  每90天执行一次
 */
 const API_HOST = "https://my.dnshe.com";
 const API_VERSION = "v2";
@@ -31,10 +24,10 @@ export default {
     }
 
     // ========== 网页面板，密码校验逻辑 ==========
-    const panelPwd = env.PANEL_PASSWORD;
-    // 如果没有配置密码，直接返回页面
-    if (!panelPwd || panelPwd.trim() === "") {
-      return new Response(pageHtml(""), {
+    const panelPwd = env.PANEL_PASSWORD ?? "admin"; // 环境变量优先，无变量默认admin
+    // 如果变量设置为空字符串""，代表关闭密码，免密访问
+    if (panelPwd.trim() === "") {
+      return new Response(pageHtml(), {
         headers: { "content-type": "text/html;charset=utf-8" },
       });
     }
@@ -47,7 +40,7 @@ export default {
       });
     }
     // 密码正确，展示面板
-    return new Response(pageHtml(""), {
+    return new Response(pageHtml(), {
       headers: { "content-type": "text/html;charset=utf-8" },
     });
   },
