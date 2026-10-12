@@ -7,7 +7,7 @@ API_KEY      必填 DNSHE API Key
 API_SECRET   必填 DNSHE API Secret
 PANEL_PASSWORD  可选，面板访问密码；不配置默认admin；设置为空字符串""则关闭密码免密访问
 
-Cron定时：0 0 */90 * *  每90天执行一次
+Cron定时：0 0 * /90 * *  每90天执行一次
 */
 const API_HOST = "https://my.dnshe.com";
 const API_VERSION = "v2";
